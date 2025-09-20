@@ -5,6 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>ETABS 梁自動編號工具</title>
     <script src="https://cdn.sheetjs.com/xlsx-latest/package/dist/xlsx.full.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/svg-pan-zoom@3.6.1/dist/svg-pan-zoom.min.js"></script>
     <style>
         body {
             font-family: 'Segoe UI', 'Microsoft JhengHei', sans-serif;
@@ -79,8 +80,8 @@
             border: 1px solid #4a6278;
             padding: 10px;
             border-radius: 5px;
-            max-height: 70vh;
-            overflow: auto;
+            /* max-height: 70vh; */ /* Removed for natural scrolling */
+            /* overflow: auto; */   /* Removed for natural scrolling */
             background-color: #2c3e50;
         }
         #drawing-svg {
@@ -115,6 +116,8 @@
             <input type="file" id="e2kFile" accept=".e2k">
             <button class="btn-process" onclick="processE2k()">開始編號</button>
             <button class="btn-export" id="exportBtn" onclick="exportToExcel()" disabled>匯出成 Excel</button>
+            <label for="floorSelect">選擇樓層:</label>
+            <select id="floorSelect" onchange="redrawCurrentData()"></select>
         </div>
         <div id="status"></div>
         <div id="output">
@@ -136,6 +139,9 @@
     <script>
         let processedBeamsData = [];
         let storyOrderInfo = {};
+        let allBeamsData = []; // Store all beams with joint coords
+        let allGrids = {}; // Store parsed grids
+        let panZoomInstance = null; // To hold the pan/zoom instance
         const TOLERANCE = 0.1;
 
         function parseGrids(content) {
@@ -353,33 +359,159 @@
             });
         }
 
-        function displayResults(labeledBeams, allBeams, svg, tableBody) {
-            tableBody.innerHTML = ''; labeledBeams.forEach(beam => { const row = tableBody.insertRow(); row.insertCell(0).textContent = beam.story; row.insertCell(1).textContent = beam.name; row.insertCell(2).textContent = beam.newLabel; row.insertCell(3).textContent = beam.prop; });
+        function displayResults(labeledBeams, allBeams, svg, tableBody, grids, story) {
+            // The table is now updated in redrawCurrentData or the main process function
             const allCoords = allBeams.flatMap(b => [b.j1, b.j2]).filter(Boolean); if (allCoords.length === 0) { svg.innerHTML = '<text x="50%" y="50%" fill="#ecf0f1" text-anchor="middle">無資料</text>'; return; }
             const minX = Math.min(...allCoords.map(p => p.x)), maxX = Math.max(...allCoords.map(p => p.x)); const minY = Math.min(...allCoords.map(p => p.y)), maxY = Math.max(...allCoords.map(p => p.y));
             const padding = 50, svgWidth = svg.clientWidth, svgHeight = svg.clientHeight; const contentWidth = maxX - minX, contentHeight = maxY - minY; let scale = Math.min((svgWidth - 2 * padding) / (contentWidth||1), (svgHeight - 2 * padding) / (contentHeight||1)) * 0.9;
             if (!isFinite(scale) || scale === 0) scale = 1;
             const transformX = (x) => padding + (x - minX) * scale; const transformY = (y) => svgHeight - padding - (y - minY) * scale;
             svg.innerHTML = '';
+
+            // Draw grid lines
+            if (grids && grids.x && grids.y) {
+                const gridGroup = document.createElementNS('http://www.w3.org/2000/svg', 'g');
+                gridGroup.setAttribute('id', 'grid-lines');
+
+                const textPadding = 5;
+                const labelFontSize = 10;
+
+                // Draw X grids (vertical lines)
+                grids.x.forEach(grid => {
+                    const x = transformX(grid.ordinate);
+                    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                    line.setAttribute('x1', x);
+                    line.setAttribute('y1', transformY(minY) - padding / 2); // Extend slightly
+                    line.setAttribute('x2', x);
+                    line.setAttribute('y2', transformY(maxY) + padding / 2); // Extend slightly
+                    line.setAttribute('stroke', '#4a6278');
+                    line.setAttribute('stroke-width', '0.5');
+                    gridGroup.appendChild(line);
+
+                    const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                    text.setAttribute('x', x);
+                    text.setAttribute('y', transformY(minY) - textPadding);
+                    text.setAttribute('fill', '#bdc3c7');
+                    text.setAttribute('font-size', labelFontSize);
+                    text.setAttribute('text-anchor', 'middle');
+                    text.textContent = grid.name;
+                    gridGroup.appendChild(text);
+                });
+
+                // Draw Y grids (horizontal lines)
+                grids.y.forEach(grid => {
+                    const y = transformY(grid.ordinate);
+                    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+                    line.setAttribute('x1', transformX(minX) - padding/2); // Extend slightly
+                    line.setAttribute('y1', y);
+                    line.setAttribute('x2', transformX(maxX) + padding/2); // Extend slightly
+                    line.setAttribute('y2', y);
+                    line.setAttribute('stroke', '#4a6278');
+                    line.setAttribute('stroke-width', '0.5');
+                    gridGroup.appendChild(line);
+
+                    const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                    text.setAttribute('x', transformX(minX) - textPadding);
+                    text.setAttribute('y', y);
+                    text.setAttribute('fill', '#bdc3c7');
+                    text.setAttribute('font-size', labelFontSize);
+                    text.setAttribute('text-anchor', 'end');
+                    text.setAttribute('alignment-baseline', 'middle');
+                    text.textContent = grid.name;
+                    gridGroup.appendChild(text);
+                });
+                svg.appendChild(gridGroup);
+            }
+
             const allDrawableBeams = allBeams.filter(b => b.j1 && b.j2);
+            const labeledBeamsMap = new Map(labeledBeams.map(b => [b.name, b]));
+
             allDrawableBeams.forEach(beam => {
                 const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-                line.setAttribute('x1', transformX(beam.j1.x)); line.setAttribute('y1', transformY(beam.j1.y));
-                line.setAttribute('x2', transformX(beam.j2.x)); line.setAttribute('y2', transformY(beam.j2.y));
-                line.setAttribute('stroke', '#7f8c8d'); line.setAttribute('stroke-width', '1'); svg.appendChild(line);
+                line.setAttribute('x1', transformX(beam.j1.x));
+                line.setAttribute('y1', transformY(beam.j1.y));
+                line.setAttribute('x2', transformX(beam.j2.x));
+                line.setAttribute('y2', transformY(beam.j2.y));
+
+                const labeledInfo = labeledBeamsMap.get(beam.name);
+
+                if (labeledInfo) {
+                    const isSpecial = labeledInfo.newLabel && (labeledInfo.newLabel.startsWith('WB') || labeledInfo.newLabel.startsWith('FWB'));
+                    line.setAttribute('stroke', isSpecial ? '#f39c12' : '#e67e22');
+                    line.setAttribute('stroke-width', '3');
+                    svg.appendChild(line);
+
+                    const text = document.createElementNS('http://www.w3.org/2000/svg', 'text');
+                    const textX = (transformX(beam.j1.x) + transformX(beam.j2.x)) / 2;
+                    const textY = (transformY(beam.j1.y) + transformY(beam.j2.y)) / 2 - 5;
+                    text.setAttribute('x', textX);
+                    text.setAttribute('y', textY);
+                    text.setAttribute('fill', '#ecf0f1');
+                    text.setAttribute('font-size', '10');
+                    text.setAttribute('text-anchor', 'middle');
+                    text.textContent = labeledInfo.newLabel;
+                    svg.appendChild(text);
+                } else {
+                    line.setAttribute('stroke', '#7f8c8d');
+                    line.setAttribute('stroke-width', '1');
+                    svg.appendChild(line);
+                }
             });
-            const labeledDrawableBeams = labeledBeams.filter(b => b.j1 && b.j2);
-            labeledDrawableBeams.forEach(beam => {
-                const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
-                line.setAttribute('x1', transformX(beam.j1.x)); line.setAttribute('y1', transformY(beam.j1.y));
-                line.setAttribute('x2', transformX(beam.j2.x)); line.setAttribute('y2', transformY(beam.j2.y));
-                const isSpecial = beam.newLabel && (beam.newLabel.startsWith('WB') || beam.newLabel.startsWith('FWB'));
-                line.setAttribute('stroke', isSpecial ? '#f39c12' : '#e67e22'); line.setAttribute('stroke-width', '3'); svg.appendChild(line);
-                const text = document.createElementNS('http://www.w3.org/2000/svg', 'text'); const textX = (transformX(beam.j1.x) + transformX(beam.j2.x)) / 2; const textY = (transformY(beam.j1.y) + transformY(beam.j2.y)) / 2 - 5;
-                text.setAttribute('x', textX); text.setAttribute('y', textY); text.setAttribute('fill', '#ecf0f1'); text.setAttribute('font-size', '10'); text.setAttribute('text-anchor', 'middle'); text.textContent = beam.newLabel; svg.appendChild(text);
+
+            // Init Pan/Zoom on the next animation frame to ensure SVG is rendered
+            requestAnimationFrame(() => {
+                panZoomInstance = svgPanZoom(svg, {
+                    zoomEnabled: true,
+                    controlIconsEnabled: true,
+                    fit: true,
+                    center: true,
+                    minZoom: 0.1,
+                    maxZoom: 20
+                });
             });
         }
         
+        function redrawCurrentData() {
+            const floorSelect = document.getElementById('floorSelect');
+            const selectedStory = floorSelect.value;
+            const svg = document.getElementById('drawing-svg');
+            const tableBody = document.querySelector("#beam-table tbody");
+            const drawingTitle = document.querySelector("#drawing h3");
+            const tableTitle = document.querySelector("#results-table h3");
+
+            let beamsToLabel = processedBeamsData;
+            let backgroundBeams = allBeamsData;
+            let tableRows = processedBeamsData;
+
+            if (selectedStory !== 'all') {
+                beamsToLabel = processedBeamsData.filter(b => b.story === selectedStory);
+                backgroundBeams = allBeamsData.filter(b => b.story === selectedStory);
+                tableRows = processedBeamsData.filter(b => b.story === selectedStory);
+                drawingTitle.textContent = `結構平面圖 (${selectedStory})`;
+                tableTitle.textContent = `編號對照表 (${selectedStory})`;
+            } else {
+                drawingTitle.textContent = `結構平面圖 (所有樓層合併)`;
+                tableTitle.textContent = `編號對照表 (所有樓層)`;
+            }
+
+            if (panZoomInstance) {
+                panZoomInstance.destroy();
+                panZoomInstance = null;
+            }
+
+            displayResults(beamsToLabel, backgroundBeams, svg, tableBody, allGrids, selectedStory);
+
+            // Update table content separately
+            tableBody.innerHTML = '';
+            tableRows.forEach(beam => {
+                const row = tableBody.insertRow();
+                row.insertCell(0).textContent = beam.story;
+                row.insertCell(1).textContent = beam.name;
+                row.insertCell(2).textContent = beam.newLabel;
+                row.insertCell(3).textContent = beam.prop;
+            });
+        }
+
         function exportToExcel() {
             if (processedBeamsData.length === 0) { alert("沒有資料可以匯出。"); return; }
             const dataForExport = [...processedBeamsData]; if (Object.keys(storyOrderInfo).length > 0) { dataForExport.sort((a, b) => storyOrderInfo[a.story] - storyOrderInfo[b.story]); }
@@ -432,10 +564,32 @@
                     return (a.newLabel || "").localeCompare(b.newLabel || "", undefined, { numeric: true });
                 });
                 
-                const allDrawableBeams = allBeamsAcrossStories.map(f => ({ ...f, j1: joints[f.joint1], j2: joints[f.joint2] }));
+                allGrids = grids; // Store grids globally
+                allBeamsData = allBeamsAcrossStories.map(f => ({ ...f, j1: joints[f.joint1], j2: joints[f.joint2] }));
                 const labeledDrawableBeams = processedBeamsData.map(b => ({...b, j1: joints[b.joint1], j2: joints[b.joint2]}));
+
+                // Populate floor dropdown
+                const floorSelect = document.getElementById('floorSelect');
+                floorSelect.innerHTML = '<option value="all">所有樓層</option>';
+                allStoryNames.forEach(story => {
+                    const option = document.createElement('option');
+                    option.value = story;
+                    option.textContent = story;
+                    floorSelect.appendChild(option);
+                });
                 
-                displayResults(labeledDrawableBeams, allDrawableBeams, svg, tableBody);
+                displayResults(labeledDrawableBeams, allBeamsData, svg, tableBody, allGrids, 'all');
+
+                // Update table content for initial load
+                tableBody.innerHTML = '';
+                processedBeamsData.forEach(beam => {
+                    const row = tableBody.insertRow();
+                    row.insertCell(0).textContent = beam.story;
+                    row.insertCell(1).textContent = beam.name;
+                    row.insertCell(2).textContent = beam.newLabel;
+                    row.insertCell(3).textContent = beam.prop;
+                });
+
                 statusDiv.innerHTML = `<p>處理完成！共 ${finalProcessedData.length} 筆資料已編號。</p>`;
                 if (processedBeamsData.length > 0) { exportBtn.disabled = false; }
             } catch (error) { statusDiv.innerHTML = `<p class="error">處理失敗：${error.message}</p>`; console.error(error); }
